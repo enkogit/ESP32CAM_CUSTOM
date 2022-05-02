@@ -4,7 +4,7 @@
 #define THINGNAME ""
 
 const char WIFI_SSID[] = "<your ssid>";
-const char WIFI_PASSWORD[] = "passphrase";
+const char WIFI_PASSWORD[] = "<passphrase>";
 const char MQTT_ENDPOINT[] = "192.168.10.1"; // Broker IP
 
 // Root CA 1
