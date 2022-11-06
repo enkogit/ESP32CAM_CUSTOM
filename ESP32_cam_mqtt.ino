@@ -1,12 +1,17 @@
 #include "secrets.h"
-#include <WiFiClientSecure.h>
-#include <MQTTClient.h>
+#include <PubSubClient.h>
 #include <ArduinoJson.h> //parse received topics
 #include "WiFi.h"
 #include "esp_camera.h"
+#include "base64.h"
+#include <libb64/cencode.h>
+#include "mbedtls/base64.h"
+#include <esp_int_wdt.h>
+#include <esp_task_wdt.h>
+// use for no hardreset at the fist loop
+bool newstart = 0;
 
-
-// camera pinout
+// ==================== ==================== CAMERA PINOUT
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -24,146 +29,164 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
-// deep sleep settings
-#define uS_TO_S_FACTOR 1000000
-#define TIME_TO_SLEEP 60
-RTC_DATA_ATTR int bootCount = 0;
-
-
-// ds18b20 temperature sensor
+// ==================== ==================== TEMPERATURE
 #include "OneWire.h" 
 #include "DallasTemperature.h"  
-#define ONE_WIRE_BUS 12         
+#define ONE_WIRE_BUS 13         
 #define __DS18B20 
 
-// DHT11 humidity sensor
-#include "DHT.h"
-#define DHTPIN 13
-#define DHTTYPE DHT11
-DHT dht(DHTPIN, DHTTYPE);
-float _h;
-float h;
-
-
-
-// The MQTT topics that this device should publish/subscribe
-#define MQTT_IOT_PUBLISH_TOPIC   "esp32/sensor/all"
+// ==================== ==================== MQTT CONFIG
+#define MQTT_IOT_PUBLISH_TOPIC   "esp32/sensors"
 #define MQTT_IOT_TEMP1 "esp32/sensor/temp_a1"
 #define MQTT_IOT_TEMP2 "esp32/sensor/temp_a2"
-#define MQTT_IOT_HUM1 "esp32/sensor/hum_a1"
+#define MQTT_IOT_TEMP3 "esp32/sensor/temp_a3"
+#define MQTT_IOT_TEMP4 "esp32/sensor/temp_a4"
+#define MQTT_IOT_RSSI "esp32/sensor/rssi_a1"
 #define MQTT_IOT_SUBSCRIBE_TOPIC "esp32/sub"
 #define ESP32CAM_PUBLISH_TOPIC   "esp32/cam_0"
 #define DEBUG                  1
-#define CLIENT_NAME "ESP32CAM"
+#define CLIENT_NAME "ESP32CAM-"
 
-const int bufferSize = 1024 * 23; // 23552 bytes
+bool flash;
+bool useMQTT = true;
+const char* mqttServer = "192.168.10.1";
+const char* HostName = "ESP32-cam";
+const char* mqttUser = "";
+const char* mqttPassword = "";
+const char* topic_IMG = "esp32/IMG";
+const char* topic_PUBLISH = "esp32/capture";
+const int MAX_PAYLOAD = 250000;
+const int bufferSize = 1024 * 43; // 23552 bytes
+
 int total_ds18b20_devices;
 DeviceAddress sensor_address;
 OneWire oneWire_DS18B20(ONE_WIRE_BUS);
 DallasTemperature _ds18b20_(&oneWire_DS18B20);
 
-
 WiFiClient net;
-MQTTClient client;
+PubSubClient client(net);
 
-// ====================== CONNECT TO MQTT Broker =========================
-
-void connectMQTT()
-{
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.println("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED){
-    delay(100);
-    Serial.print(".");
-  }
-  if(WiFi.status() == WL_CONNECTED){
-    Serial.println("\nWiFi Connected, IP: ");
-    Serial.println(WiFi.localIP());
-    delay(2000);
-  }
-
-  // Connect to the MQTT broker endpoint
-  client.begin("192.168.10.1", net);
-
-  // Create a message handler
-  client.onMessage(messageHandler);
-  Serial.println("\nConnecting to MQTT BROKER");
-  
-
-  while (!client.connect(CLIENT_NAME)) {
-    Serial.print(".");
-    delay(600);
-  }
-
-  if(!client.connected()){
-    Serial.println("MQTT BROKER Timeout!");
-    Serial.println("=========================\n");
-    return;
+void reconnect() {
+  Serial.println("mqtt reconnect start");
+  if (!client.connected()) {
+    if ( WiFi.status() != WL_CONNECTED )
+        {
+          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+          Serial.println(".....");
+          delay(5000); // give time to open up the serial monitor
+          WiFi.onEvent(WiFiStationConnected, SYSTEM_EVENT_STA_CONNECTED);
+          WiFi.onEvent(WiFiGotIP, SYSTEM_EVENT_STA_GOT_IP);
+          WiFi.onEvent(WiFiStationDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
+        }
+    if ( newstart == 0 )
+        {
+          hard_restart();
+        }  
+    Serial.println("Attempting MQTT connection...");
+    client.setServer(mqttServer, 1883);
+    client.setBufferSize (MAX_PAYLOAD); //This is the maximum payload length
+    client.setCallback(callback);
+    client.setKeepAlive(300);
+    client.setSocketTimeout(180);
+    if (client.connect(CLIENT_NAME)) {
+      Serial.println("connected");
+      client.publish("esp32/sensor", "hello world");
+      client.subscribe(MQTT_IOT_SUBSCRIBE_TOPIC);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" wait 0.5 seconds");
+      delay(500);
+    }
   }
 
-  // Subscribe to a topic
-  client.subscribe(MQTT_IOT_SUBSCRIBE_TOPIC);
-
-  Serial.println("MQTT BROKER Connected!");
-  Serial.println("=========================\n");
-  delay(100);
+  Serial.println("mqtt reconnect ende");
 }
 
-// --------------------------------- READ SENSORS ---------------------------
+void hard_restart() {
+  esp_task_wdt_init(1,true);
+  esp_task_wdt_add(NULL);
+  while(true);
+}
+
+void callback(String topic, byte* message, unsigned int length) {
+  String messageTemp;
+  Serial.println(topic);
+  for (int i = 0; i < length; i++) {
+    messageTemp += (char)message[i];
+  }
+  if (topic == topic_IMG) {
+    grabImage();
+  }
+}
+
+// ==================== ==================== READING SENSORS ==================== ==================== 
 float read_ds18b20(uint8_t index){
   _ds18b20_.requestTemperatures();
   float temp = _ds18b20_.getTempCByIndex(index);
   return temp;
 }
 
-float read_DHT(){
-  dht.begin();
-  delay(2000);
-  float h = dht.readHumidity();
-  if (!isnan(h)){
-    _h = h;
-    return h;
-  }else{
-    return _h;
-  }
-  
-}
-
- // --------------------------------- PUBLISH MESSAGE --------------------------
+// ==================== ==================== PUBLISH SENSORS  ==================== ====================
 void publishSensors()
 {
   StaticJsonDocument<200> doc;
+  // ====================================== TEMP 1
   float ds18b20_temp_a1 = read_ds18b20(0);
   delay(1000);
   Serial.print("Temp  1: ");
   Serial.print(String(ds18b20_temp_a1));
   Serial.print("C");
   Serial.print("\t Publishing Sensor\tresult:\t");
-  bool result_temp_a1 =  client.publish(MQTT_IOT_TEMP1, String(ds18b20_temp_a1));
+  bool result_temp_a1 =  client.publish(MQTT_IOT_TEMP1, String(ds18b20_temp_a1, 2).c_str());
   Serial.println(result_temp_a1);
-  
+
+  // ====================================== TEMP 2
   float ds18b20_temp_a2 = read_ds18b20(1);
   delay(1000);
   Serial.print("Temp  2: ");
   Serial.print(String(ds18b20_temp_a2));
   Serial.print("C");
   Serial.print("\t Publishing Sensor\tresult:\t");
-  bool result_temp_a2 =  client.publish(MQTT_IOT_TEMP2, String(ds18b20_temp_a2));
+  bool result_temp_a2 =  client.publish(MQTT_IOT_TEMP2, String(ds18b20_temp_a2, 2).c_str());
   Serial.println(result_temp_a2);
 
-  float DHT11_hum_a1 = read_DHT();
+  // ====================================== TEMP 3
+  float ds18b20_temp_a3 = read_ds18b20(2);
   delay(1000);
-  Serial.print("Hum   1:  ");
-  Serial.print(String(DHT11_hum_a1));
-  Serial.print("%");
-  Serial.print("\t\t Publishing Sensor\tresult:\t");
-  bool result_hum_a1 =  client.publish(MQTT_IOT_HUM1, String(DHT11_hum_a1));
-  Serial.println(result_hum_a1);
-  
-  doc["temp_a2"] = String(ds18b20_temp_a1);
+  Serial.print("Temp  3: ");
+  Serial.print(String(ds18b20_temp_a3));
+  Serial.print("C");
+  Serial.print("\t Publishing Sensor\tresult:\t");
+  bool result_temp_a3 =  client.publish(MQTT_IOT_TEMP3, String(ds18b20_temp_a3, 2).c_str());
+  Serial.println(result_temp_a3);
+
+  // ====================================== TEMP 3
+  float ds18b20_temp_a4 = read_ds18b20(3);
+  delay(1000);
+  Serial.print("Temp  4: ");
+  Serial.print(String(ds18b20_temp_a4));
+  Serial.print("C");
+  Serial.print("\t Publishing Sensor\tresult:\t");
+  bool result_temp_a4 =  client.publish(MQTT_IOT_TEMP4, String(ds18b20_temp_a4, 2).c_str());
+  Serial.println(result_temp_a4);
+
+  // ====================================== WIFI RSSI
+  float esp32cam_rssi = WiFi.RSSI();
+  delay(1000);
+  Serial.print("Connection RSSI  : ");
+  Serial.print(String(esp32cam_rssi));
+  Serial.print("dB");
+  Serial.print("\t Publishing Sensor\tresult:\t");
+  bool result_rssi =  client.publish(MQTT_IOT_RSSI, String(esp32cam_rssi, 2).c_str());
+  Serial.println(result_rssi);
+
+  // ====================================== WRITE TO DOCUMENT
+  doc["temp_a1"] = String(ds18b20_temp_a1);
   doc["temp_a2"] = String(ds18b20_temp_a2);
-  doc["hum_a1"] = String(DHT11_hum_a1);
+  doc["temp_a3"] = String(ds18b20_temp_a3);
+  doc["temp_a4"] = String(ds18b20_temp_a4);
+  doc["rssi"] = String(esp32cam_rssi);
   
   char jsonBuffer[512];
   serializeJson(doc, jsonBuffer); // print to client
@@ -173,16 +196,12 @@ void publishSensors()
 
 void messageHandler(String &topic, String &payload) {
   Serial.println("incoming: " + topic + " - " + payload);
-
-//  StaticJsonDocument<200> doc;
-//  deserializeJson(doc, payload);
-//  const char* message = doc["message"];
 }
 
 
-// ------------------------------ CAMERA INIT --------------------------
+// ==================== ==================== CAMERA INIT
 void cameraInit(){
-  Serial.print("\nInitializing Camera...");
+  Serial.println("\nInitializing Camera...");
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -205,9 +224,9 @@ void cameraInit(){
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAMESIZE_VGA; // 640x480
-  config.jpeg_quality = 10;
+  config.jpeg_quality = 5;
   config.fb_count = 2;
-  
+
   // camera init
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -215,92 +234,83 @@ void cameraInit(){
     ESP.restart();
     return;
   }
-  Serial.println(", done...");
+  Serial.println("Camera initialization complete.");
   
 }
-
-void grabImage(){
-  
-  camera_fb_t * fb = esp_camera_fb_get();
-  if(fb != NULL && fb->format == PIXFORMAT_JPEG && fb->len < bufferSize){
-    Serial.print("Taking Image. Length: ");
-    Serial.print(fb->len);
-    Serial.print("\t Publishing Image\tresult:\t");
-    delay(1000);
-    bool result = client.publish(ESP32CAM_PUBLISH_TOPIC, (const char*)fb->buf, fb->len, false);
-//    bool result = client.publish(ESP32CAM_PUBLISH_TOPIC, (const char*)fb->buf, fb->len);
-    delay(3000);
-    Serial.println(result);
-
-    if(!result){
-      ESP.restart();
-    }
+void grabImage() {
+  camera_fb_t * fb = NULL;
+  Serial.println("Taking picture");
+  fb = esp_camera_fb_get(); // used to get a single picture.
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return;
   }
-  esp_camera_fb_return(fb);
-  delay(1);
+  Serial.println("Picture taken");
+  sendMQTT(fb->buf, fb->len);
+  esp_camera_fb_return(fb); // must be used to free the memory allocated by esp_camera_fb_get().
+  
 }
 
+void sendMQTT(const uint8_t * buf, uint32_t len){
+  Serial.println("Sending picture...");
+  if(len>MAX_PAYLOAD){
+    Serial.println("LEN:");
+    Serial.println(String(len));
+    Serial.println("Picture too large, increase the MAX_PAYLOAD value");
+  }else{
+    Serial.print("LEN:\t");
+    Serial.println(String(len));
+    Serial.print("Picture sent ? :\t");
+    Serial.println(client.publish(ESP32CAM_PUBLISH_TOPIC, buf, len, false));
+    delay(1000);
+  }
+}
 
-// ------------------------------ SETUP 
+void WiFiStationConnected(WiFiEvent_t event, WiFiEventInfo_t info){
+  Serial.println("Connected to AP successfully!");
+}
 
+void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info){
+  Serial.print("WiFi connected, IP: ");
+  Serial.print(WiFi.localIP());
+  Serial.println(" ");
+}
+
+void WiFiStationDisconnected(WiFiEvent_t event, WiFiEventInfo_t info){
+  Serial.print("Disconnected from WiFi access point, reason:");
+  Serial.println(info.disconnected.reason);
+  Serial.print("Connecting to: ");
+  Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  delay(2000);
+  reconnect();
+}
+
+// ==================== ==================== SETUP
 void setup() {
+  newstart = 1;
   Serial.begin(115200);
+  Serial.print("Initialize sensors");
   _ds18b20_.begin();
-  delay(2000); // give time to open up the serial monitor
-  
-  Serial.println("\n\n=========================");
-  Serial.println("waking up, been sleeping for: " + String(TIME_TO_SLEEP) + "s");
-  total_ds18b20_devices = _ds18b20_.getDeviceCount();
-  
-  Serial.print("Devices found: ");
-  Serial.print(total_ds18b20_devices, DEC);
-  Serial.print(" ");
-  
-  // set wakeup interval
-  esp_sleep_enable_timer_wakeup(TIME_TO_SLEEP * uS_TO_S_FACTOR);
-  
-  // increment the boot number and print it every boot
-  ++bootCount;
-  Serial.println("Boot count number: " + String(bootCount));
-
-  // wakeup reason
-  print_wakeup_reason();
-  
-  //connect to wifi and broker
-  connectMQTT();
-  publishSensors();
-  delay(1000);
-  
-  // initialize camera and publish message
+  // initialize camera
   cameraInit();
-  delay(1000);
-  if(client.connected()) grabImage();
+  Serial.println("Connecting to WiFi");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.println(".....");
+  delay(5000); // give time to open up the serial monitor
+  WiFi.onEvent(WiFiStationConnected, SYSTEM_EVENT_STA_CONNECTED);
+  WiFi.onEvent(WiFiGotIP, SYSTEM_EVENT_STA_GOT_IP);
+  WiFi.onEvent(WiFiStationDisconnected, SYSTEM_EVENT_STA_DISCONNECTED);
   
   
-  client.loop();
-  
-  Serial.println("\nfinished cycle, entering deep sleep for: "  + String(TIME_TO_SLEEP) + "s");
-  Serial.println("=========================\n\n");
-
-  //hush little baby
-  esp_deep_sleep_start();
 }
 
 void loop() {
-
-}
-
-void print_wakeup_reason(){
-  // function prints wakeup reason for the esp32
-  esp_sleep_wakeup_cause_t wakeup_reason;
-  wakeup_reason = esp_sleep_get_wakeup_cause();
-  switch(wakeup_reason){
-    case 1  : Serial.println("Wakeup caused by external signal using RTC_IO"); break;
-    case 2  : Serial.println("Wakeup caused by external signal using RTC_CNTL"); break;
-    case 3  : Serial.println("Wakeup caused by a timer"); break;
-    case 4  : Serial.println("Wakeup caused by touchpad"); break;
-    case 5  : Serial.println("Wakeup caused by ULP program"); break;
-    default : Serial.println("Wakeup was NOT caused by deep sleep"); break;
-  }
-  
+  if(!client.connected()) reconnect();
+  if(client.connected()) grabImage();
+  if(client.connected()) publishSensors();
+  newstart = 0;
+  client.loop();
+  Serial.println("==== 60s Loop, No Sleep =====================\n\n");
+  delay(60000);
 }
